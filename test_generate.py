@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from pathlib import Path
+from time import time
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,7 @@ def get_args():
     parser.add_argument("--temperature", type=float, default=1.0, help="If you don't wanna use this, set to 1.0")
     parser.add_argument("--top_p", type=float, default=0.95, help="If you don't wanna use this, set to 1.0")
     parser.add_argument("--top_k", type=int, default=50, help="If you don't wanna use this, set to 0")
+    parser.add_argument("--use_cache", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -41,6 +43,7 @@ def main():
     test_ckpt_dirpath = Path("./temp_ckpt_for_test").absolute()
 
     if rank == 0:
+        start_time = time()
         if not test_ckpt_dirpath.exists():
             tokenizer = AutoTokenizer.from_pretrained("heegyu/kogpt-j-350m")
             model = AutoModelForCausalLM.from_pretrained("heegyu/kogpt-j-350m")
@@ -91,7 +94,6 @@ def main():
     input_idss = input_idss[:, -valid_max_sequence_length.item() :]
 
     buffer_idss = input_idss
-    valid_max_sequence_length_of_buffer_idss = valid_max_sequence_length
 
     num_new_tokens = 0
     max_new_tokens = args.max_new_tokens
@@ -100,48 +102,99 @@ def main():
     if rank == 0:
         output_idss = torch.tensor([[] for _ in range(batch_size)], dtype=torch.int64).to(f"cuda:{rank}")
 
-    while num_new_tokens <= max_new_tokens:
-        with torch.no_grad():
-            logits = model(buffer_idss).logits
+    if args.use_cache:
+        buffer_past_key_values = None
 
-        if rank == 0:
-            if is_greedy:
-                next_token_idss = logits[:, -1, :].argmax(-1).unsqueeze(-1)
-            else:
-                list_of_warpers = []
-                if 0 < args.top_p < 1:
-                    list_of_warpers.append(TopPLogitsWarper(args.top_p))
-                if args.top_k > 0:
-                    list_of_warpers.append(TopKLogitsWarper(args.top_k))
-                if args.temperature != 1.0:
-                    list_of_warpers.append(TemperatureLogitsWarper(args.temperature))
-                if not list_of_warpers:
-                    logits_warpers = LogitsProcessorList(list_of_warpers)
-                    next_token_scores = logits_warpers(buffer_idss, logits[:, -1, :])
+        while num_new_tokens < max_new_tokens:
+            with torch.no_grad():
+                outputs = model(buffer_idss, past_key_values=buffer_past_key_values, use_cache=True)
+                logits = outputs.logits
+                buffer_past_key_values = outputs.past_key_values
+                buffer_idss = torch.tensor([[0] for _ in range(batch_size)], dtype=torch.int64).to(f"cuda:{rank}")
+
+            if rank == 0:
+                if is_greedy:
+                    next_token_idss = logits[:, -1, :].argmax(-1).unsqueeze(-1)
                 else:
-                    next_token_scores = logits[:, -1, :]
-                probs = softmax(next_token_scores, -1)
-                next_token_idss = torch.multinomial(probs, num_samples=1)
+                    list_of_warpers = []
+                    if 0 < args.top_p < 1:
+                        list_of_warpers.append(TopPLogitsWarper(args.top_p))
+                    if args.top_k > 0:
+                        list_of_warpers.append(TopKLogitsWarper(args.top_k))
+                    if args.temperature != 1.0:
+                        list_of_warpers.append(TemperatureLogitsWarper(args.temperature))
+                    if not list_of_warpers:
+                        logits_warpers = LogitsProcessorList(list_of_warpers)
+                        next_token_scores = logits_warpers(buffer_idss, logits[:, -1, :])
+                    else:
+                        next_token_scores = logits[:, -1, :]
+                    probs = softmax(next_token_scores, -1)
+                    next_token_idss = torch.multinomial(probs, num_samples=1)
 
-            output_idss = torch.cat((output_idss, next_token_idss), dim=-1)
-            buffer_idss = torch.cat((buffer_idss, next_token_idss), dim=-1)
-            valid_max_sequence_length_of_buffer_idss += 1
+                buffer_idss = next_token_idss
+                output_idss = torch.cat((output_idss, next_token_idss), dim=-1)
+            valid_max_sequence_length += 1
 
-            if valid_max_sequence_length_of_buffer_idss > max_sequence_length:
-                buffer_idss = buffer_idss[:, -max_sequence_length:]
-                valid_max_sequence_length_of_buffer_idss = torch.tensor(max_sequence_length).to(f"cuda:{rank}")
+            if valid_max_sequence_length > max_sequence_length:
+                buffer_past_key_values = []
 
-        dist.broadcast(valid_max_sequence_length_of_buffer_idss, src=0)
+                for past_key_value in outputs.past_key_values:
+                    buffer_past_key_values.append(
+                        (
+                            past_key_value[0][:, :, -max_sequence_length + 1 :, :],
+                            past_key_value[1][:, :, -max_sequence_length + 1 :, :],
+                        )
+                    )
+                buffer_past_key_values = tuple(buffer_past_key_values)
 
-        if rank != 0:
-            buffer_idss = torch.zeros(
-                (batch_size, valid_max_sequence_length_of_buffer_idss.item()), dtype=torch.int64
-            ).to(f"cuda:{rank}")
-        dist.broadcast(buffer_idss, src=0)
+            dist.broadcast(buffer_idss, src=0)
+            num_new_tokens += 1
+    else:
+        while num_new_tokens < max_new_tokens:
+            with torch.no_grad():
+                outputs = model(buffer_idss, use_cache=False)
+                logits = outputs.logits
 
-        num_new_tokens += 1
+            if rank == 0:
+                if is_greedy:
+                    next_token_idss = logits[:, -1, :].argmax(-1).unsqueeze(-1)
+                else:
+                    list_of_warpers = []
+                    if 0 < args.top_p < 1:
+                        list_of_warpers.append(TopPLogitsWarper(args.top_p))
+                    if args.top_k > 0:
+                        list_of_warpers.append(TopKLogitsWarper(args.top_k))
+                    if args.temperature != 1.0:
+                        list_of_warpers.append(TemperatureLogitsWarper(args.temperature))
+                    if not list_of_warpers:
+                        logits_warpers = LogitsProcessorList(list_of_warpers)
+                        next_token_scores = logits_warpers(buffer_idss, logits[:, -1, :])
+                    else:
+                        next_token_scores = logits[:, -1, :]
+                    probs = softmax(next_token_scores, -1)
+                    next_token_idss = torch.multinomial(probs, num_samples=1)
+
+                output_idss = torch.cat((output_idss, next_token_idss), dim=-1)
+                buffer_idss = torch.cat((buffer_idss, next_token_idss), dim=-1)
+                valid_max_sequence_length += 1
+
+                if valid_max_sequence_length > max_sequence_length:
+                    buffer_idss = buffer_idss[:, -max_sequence_length:]
+                    valid_max_sequence_length = torch.tensor(max_sequence_length).to(f"cuda:{rank}")
+
+            dist.broadcast(valid_max_sequence_length, src=0)
+
+            if rank != 0:
+                buffer_idss = torch.zeros((batch_size, valid_max_sequence_length.item()), dtype=torch.int64).to(
+                    f"cuda:{rank}"
+                )
+            dist.broadcast(buffer_idss, src=0)
+
+            num_new_tokens += 1
 
     if rank == 0:
+        end_time = time()
+        print(f"elapsed time: {end_time - start_time}")
         print(f"prompts: {list_of_prompts}")
         print(f"continuations: {[tokenizer.decode(output_ids) for output_ids in output_idss]}")
 
