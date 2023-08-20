@@ -27,9 +27,7 @@ def get_args():
     broker_group = parser.add_argument_group("broker")
     broker_group.add_argument("--redis_host", type=str, default="127.0.0.1")
     broker_group.add_argument("--redis_port", type=int, default=20000)
-    args = parser.parse_args(
-        ["--model_type", "gptj", "--pretrained_model_path", "/data/nick_262/llmss/temp_ckpt_for_test"]
-    )
+    args = parser.parse_args()
     return args
 
 
