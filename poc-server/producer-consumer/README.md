@@ -7,13 +7,13 @@ pip install -r requirements.txt
 ```
 
 ## Launch
-### broker
+### Broker
 ```bash
 # before install redis
 redis-server --port 20000
 ```
 
-### publisher
+### Producer
 ```bash
 python producer_server.py \
 --fastapi_host 127.0.0.1 \
@@ -22,7 +22,7 @@ python producer_server.py \
 --redis_port 20000
 ```
 
-### subscriber
+### Consumer
 ```bash
 # Currently, only support gptj
 # Require gpus along number of --nproc_per_node
