@@ -1,11 +1,10 @@
 from argparse import ArgumentParser
-from pathlib import Path
 from time import time
 
 import torch
 import torch.distributed as dist
 from torch.nn.functional import softmax
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     TemperatureLogitsWarper,
@@ -13,7 +12,7 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-from llmss.server.models.custom_modeling.gptj_modeling import GPTJForCausalLM
+from llmss.server.models.custom_modeling import MODEL_REGISTRY
 from llmss.server.models.utils.dist import initialize_torch_distributed
 from llmss.server.models.utils.hub import weight_files
 from llmss.server.models.utils.weights import Weights
@@ -21,6 +20,7 @@ from llmss.server.models.utils.weights import Weights
 
 def get_args():
     parser = ArgumentParser()
+    parser.add_argument("--pretrained_model_path", type=str, required=True)
     parser.add_argument("--prompts", type=str, nargs="+", required=True)
     parser.add_argument("--max_new_tokens", type=int, default=20)
     parser.add_argument("--is_greedy", action="store_true")
@@ -40,37 +40,32 @@ def main():
     assert args.top_k >= 0, f"Value of top_k is not valid."
 
     process_group, rank, world_size = initialize_torch_distributed()
-    test_ckpt_dirpath = Path("./temp_ckpt_for_test").absolute()
 
     if rank == 0:
         start_time = time()
-        if not test_ckpt_dirpath.exists():
-            tokenizer = AutoTokenizer.from_pretrained("heegyu/kogpt-j-350m")
-            model = AutoModelForCausalLM.from_pretrained("heegyu/kogpt-j-350m")
-            tokenizer.save_pretrained(test_ckpt_dirpath)
-            model.save_pretrained(test_ckpt_dirpath, safe_serialization=True)
-
-    torch.distributed.barrier(process_group)
-
-    device = torch.device(f"cuda:{rank}")
-    dtype = torch.float16
-
     tokenizer = AutoTokenizer.from_pretrained(
-        test_ckpt_dirpath,
+        args.pretrained_model_path,
         padding_side="left",
         truncation_side="left",
     )
 
+    device = torch.device(f"cuda:{rank}")
+    dtype = torch.float16
+
     config = AutoConfig.from_pretrained(
-        test_ckpt_dirpath,
+        args.pretrained_model_path,
     )
+
+    model_type = config.__class__.__name__.lower()
+    model_type = model_type.replace("config", "")
     max_sequence_length = config.n_positions
 
     torch.distributed.barrier(process_group)
-    filenames = weight_files(test_ckpt_dirpath)
+
+    filenames = weight_files(args.pretrained_model_path)
     weights = Weights(filenames, device=device, dtype=dtype, process_group=process_group)
 
-    model = GPTJForCausalLM(config, weights)
+    model = MODEL_REGISTRY[model_type](config, weights)
     model.eval()
 
     list_of_prompts = args.prompts
@@ -152,6 +147,7 @@ def main():
     else:
         while num_new_tokens < max_new_tokens:
             with torch.no_grad():
+
                 outputs = model(buffer_idss, use_cache=False)
                 logits = outputs.logits
 
@@ -188,6 +184,8 @@ def main():
                 buffer_idss = torch.zeros((batch_size, valid_max_sequence_length.item()), dtype=torch.int64).to(
                     f"cuda:{rank}"
                 )
+
+            torch.cuda.empty_cache() # Prevent cuda memory leak
             dist.broadcast(buffer_idss, src=0)
 
             num_new_tokens += 1
