@@ -20,21 +20,29 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...modeling_outputs import (
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from ...modeling_utils import PreTrainedModel
-from ...utils import (
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
 )
-from .configuration_gpt_bigcode import GPTBigCodeConfig
+from transformers.models.gpt_bigcode.configuration_gpt_bigcode import GPTBigCodeConfig
+
+from ..utils.layers import (
+    FastLinear,
+    TensorParallelEmbedding,
+    TensorParallelColumnLinear,
+    TensorParallelRowLinear,
+    TensorParallelHead,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -79,16 +87,16 @@ def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor
 
 
 class GPTBigCodeAttention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, prefix, config: GPTBigCodeConfig, weights, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.mask_value = None
 
         self.multi_query = config.multi_query
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
+        self.head_dim = self.embed_dim // self.num_heads            # 6144 // 48 == 128
         self.kv_heads = 1 if self.multi_query else self.num_heads
-        self.kv_dim = self.kv_heads * self.head_dim
+        self.kv_dim = self.kv_heads * self.head_dim                 # 1 * 128 == 128
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -105,16 +113,64 @@ class GPTBigCodeAttention(nn.Module):
             config.scale_attention_softmax_in_fp32 and config.attention_softmax_in_fp32
         )
 
+        self.process_group = weights.process_group
+        if self.num_heads % self.process_group.size() != 0:
+            raise ValueError(
+                f"`num_attention_heads` must be divisible by `num_shards` (got `num_attention_heads`: {self.num_heads} "
+                f"and `num_shards`: {self.process_group.size()}"
+            )
+        self.num_heads_per_shard = self.num_heads // self.process_group.size()
+
         if self.is_cross_attention:
             if self.multi_query:
                 raise NotImplementedError("Multi-Query Attention not supported for cross_attention")
 
-            self.c_attn = nn.Linear(self.embed_dim, 2 * self.embed_dim)
-            self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
+            self.c_attn = TensorParallelColumnLinear.load(
+                config=config, prefix=f"{prefix}.c_attn", weights=weights, bias=True
+            )
+            self.q_attn = TensorParallelColumnLinear.load(
+                config=config, prefix=f"{prefix}.q_attn", weights=weights, bias=True
+            )
         else:
-            self.c_attn = nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
+            # 1. Load tensors
+            c_attn_weight = weights.get_tensor(f"{prefix}.c_attn.weight")
+            c_attn_bias = weights.get_tensor(f"{prefix}.c_attn.bias")
+            
+            # 2. Split the tensor into 2 matrices (q_attn, kv_attn)
+            q_attn_weight, kv_attn_weight = c_attn_weight.split((self.embed_dim, 2 * self.kv_dim), dim=0)
+            q_attn_bias, kv_attn_bias = c_attn_bias.split((self.embed_dim, 2 * self.kv_dim), dim=0)
 
-        self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            # 3. Slice by its rank
+            dim = 0     # due to this was meant for ColumnLinear
+            world_size = self.process_group.size()
+            rank = self.process_group.rank()
+            size = q_attn_weight.size(dim)
+            block_size = size // world_size
+            start = rank * block_size
+            stop = (rank + 1) * block_size
+            
+            if dim == 0:
+                q_attn_weight_tensor = q_attn_weight[start:stop]
+                q_attn_bias_tensor = q_attn_bias[start:stop]
+            elif dim == 1:
+                q_attn_weight_tensor = q_attn_weight[:, start:stop]
+                q_attn_bias_tensor = q_attn_bias[:, start:stop]
+            else:
+                raise NotImplementedError("Let's make that generic when needed")
+            
+            # 4. Construct TensorParallelColumnLinear with FastLinear
+            self.q_attn = TensorParallelColumnLinear(FastLinear(weight=q_attn_weight_tensor, bias=q_attn_bias_tensor))
+            
+            self.kv_attn = nn.Linear(
+                in_features=self.embed_dim, out_features=2 * self.kv_dim, dtype=self.q_attn.linear.weight.dtype
+            ).to(f"cuda:{rank}")
+            with torch.no_grad():
+                self.kv_attn.weight.copy_(kv_attn_weight)
+                self.kv_attn.bias.copy_(kv_attn_bias)
+
+        self.c_proj = TensorParallelRowLinear.load(
+            config=config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
+        )
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -136,6 +192,7 @@ class GPTBigCodeAttention(nn.Module):
             scale_factor /= self.head_dim**0.5
 
         # MQA models: (batch_size, query_length, num_heads * head_dim)
+        # MQA models sharded: (batch_size, query_length, (num_heads / shard_size) * head_dim)
         # MHA models: (batch_size, num_heads, query_length, head_dim)
         query_shape = query.shape
         batch_size = query_shape[0]
@@ -144,10 +201,10 @@ class GPTBigCodeAttention(nn.Module):
             # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
             # -> (batch_size, query_length, num_heads, key_length)
             query_length = query_shape[1]
-            attn_shape = (batch_size, query_length, self.num_heads, key_length)
-            attn_view = (batch_size, query_length * self.num_heads, key_length)
+            attn_shape = (batch_size, query_length, self.num_heads_per_shard, key_length)
+            attn_view = (batch_size, query_length * self.num_heads_per_shard, key_length)
             # No copy needed for MQA 2, or when layer_past is provided.
-            query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+            query = query.reshape(batch_size, query_length * self.num_heads_per_shard, self.head_dim)
         else:
             # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
             # -> (batch_size, num_heads, query_length, key_length)
@@ -227,7 +284,10 @@ class GPTBigCodeAttention(nn.Module):
             key_value = self.c_attn(encoder_hidden_states)
             attention_mask = encoder_attention_mask
         elif self.multi_query:
-            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            # hidden_states: (bsz, seq_len, hnp)
+            # query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            query = self.q_attn(hidden_states)          # (B, q_len, H) -> (B, q_len, hp) == (1, 7, 6144/2)
+            key_value = self.kv_attn(hidden_states)     # (B, k_len, H) -> (B, k_len, 2*head_dim) == (1, 7, 2*128)            
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
@@ -263,11 +323,15 @@ class GPTBigCodeAttention(nn.Module):
 
 
 class GPTBigCodeMLP(nn.Module):
-    def __init__(self, intermediate_size, config):
+    def __init__(self, prefix, config: GPTBigCodeConfig, weights):
         super().__init__()
-        embed_dim = config.hidden_size
-        self.c_fc = nn.Linear(embed_dim, intermediate_size)
-        self.c_proj = nn.Linear(intermediate_size, embed_dim)
+        
+        self.c_fc = TensorParallelColumnLinear.load(
+            config=config, prefix=f"{prefix}.c_fc", weights=weights, bias=True
+        )
+        self.c_proj = TensorParallelRowLinear.load(
+            config=config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
+        )
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -281,22 +345,24 @@ class GPTBigCodeMLP(nn.Module):
 
 
 class GPTBigCodeBlock(nn.Module):
-    def __init__(self, config, layer_idx=None):
+    def __init__(self, prefix, config: GPTBigCodeConfig, weights, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
         self.inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPTBigCodeAttention(config, layer_idx=layer_idx)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        # pre layer-norm
+        self.ln_1 = nn.LayerNorm.load(prefix=f"{prefix}.ln_1", weights=weights, eps=config.layer_norm_epsilon)
+        self.attn = GPTBigCodeAttention(prefix=f"{prefix}.attn", config=config, weights=weights, layer_idx=layer_idx)
+        # post layer-norm
+        self.ln_2 = nn.LayerNorm.load(prefix=f"{prefix}.ln_2", weights=weights, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
             if config.multi_query:
                 raise NotImplementedError("Cross-attention not implemented for MQA")
-            self.crossattention = GPTBigCodeAttention(config, is_cross_attention=True, layer_idx=layer_idx)
-            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            self.crossattention = GPTBigCodeAttention(prefix=f"{prefix}.crossattention", config=config, weights=weights, is_cross_attention=True)
+            self.ln_cross_attn = nn.LayerNorm.load(prefix=f"{prefix}.ln_cross_attn", weights=weights, eps=config.layer_norm_epsilon)
 
-        self.mlp = GPTBigCodeMLP(self.inner_dim, config)
+        self.mlp = GPTBigCodeMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
     def forward(
         self,
@@ -500,17 +566,26 @@ GPT_BIGCODE_INPUTS_DOCSTRING = r"""
     GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeModel(GPTBigCodePreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config: GPTBigCodeConfig, weights):
         super().__init__(config)
         self.multi_query = config.multi_query
         self.embed_dim = config.hidden_size
 
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        process_group = weights.process_group
+        self.tp_rank = process_group.rank()
+        self.tp_world_size = process_group.size()
+        
+        self.wte = TensorParallelEmbedding(prefix="transformer.wte", weights=weights)
+        self.wpe = TensorParallelEmbedding(prefix="transformer.wpe", weights=weights)   # need to check        
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        self.h = nn.ModuleList(
+            [
+                GPTBigCodeBlock(prefix=f"transformer.h.{layer_id}", config=config, weights=weights, layer_idx=layer_id) 
+                for layer_id in range(config.n_layer)
+            ]
+        )
+        self.ln_f = nn.LayerNorm.load(prefix="transformer.ln_f", weights=weights, eps=config.layer_norm_epsilon)
 
         max_positions = config.max_position_embeddings
         self.register_buffer(
@@ -519,8 +594,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        # We initialize a model by loading the pre-trained weights
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.wte
@@ -560,10 +635,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+            # TODO: The line below would give an error for a certain version of PyTorch. This is needed to check later.
+            # self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
-            batch_size = input_ids.shape[0]
+            batch_size = input_ids.shape[0]            
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
             batch_size = inputs_embeds.shape[0]
@@ -605,11 +681,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
             self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
                 dtype=torch.bool, device=self_attention_mask.device
             )
-
         # MQA models: (batch_size, query_length, n_heads, key_length)
         # MHA models: (batch_size, n_heads, query_length, key_length)
         attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
-
+        # Unlike other models, this model applies attn_mask separately, thus required to be loaded on the same device as model on.
+        attention_mask = attention_mask.to(device=device)
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if (
@@ -632,7 +708,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
+        position_embeds = self.wpe(position_ids)    # (B, L, H)
+
         hidden_states = inputs_embeds + position_embeds
 
         if token_type_ids is not None:
@@ -723,13 +800,18 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 class GPTBigCodeForCausalLM(GPTBigCodePreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, weights):
         super().__init__(config)
-        self.transformer = GPTBigCodeModel(config)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer = GPTBigCodeModel(config, weights)
+        # starcoder is a tied-model (wte == lm_head)
+        self.lm_head = TensorParallelHead.load(
+            config,
+            prefix="lm_head",
+            weights=weights,
+        )
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        # We initialize a model by loading the pre-trained weights
+        # self.post_init()
 
     def get_output_embeddings(self):
         return self.lm_head
