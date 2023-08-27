@@ -58,7 +58,7 @@ def main():
     filenames = weight_files(args.pretrained_model_path)
     weights = Weights(filenames, device=cuda_device, dtype=dtype, process_group=process_group)
 
-    model = MODEL_REGISTRY["gptj"](config, weights)
+    model = MODEL_REGISTRY[args.model_type](config, weights)
     model.eval()
 
     torch.distributed.barrier(process_group)
