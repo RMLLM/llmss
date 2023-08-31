@@ -1,7 +1,7 @@
 from .gptj_modeling import GPTJForCausalLM
-from .modeling_gpt_bigcode import GPTBigCodeForCausalLM
+from .gpt_bigcode_modeling import GPTBigCodeForCausalLM
 
 MODEL_REGISTRY = {
     "gptj": GPTJForCausalLM,
-    "starcoder": GPTBigCodeForCausalLM,
+    "gpt_bigcode": GPTBigCodeForCausalLM,
 }
