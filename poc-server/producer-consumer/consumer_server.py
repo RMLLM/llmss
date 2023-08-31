@@ -22,7 +22,6 @@ from llmss.server.models.utils.weights import Weights
 def get_args():
     parser = ArgumentParser()
     consumer_group = parser.add_argument_group("consumer")
-    consumer_group.add_argument("--model_type", type=str, required=True)
     consumer_group.add_argument("--pretrained_model_path", type=str, required=True)
     broker_group = parser.add_argument_group("broker")
     broker_group.add_argument("--redis_host", type=str, default="127.0.0.1")
@@ -58,10 +57,13 @@ def main():
     filenames = weight_files(args.pretrained_model_path)
     weights = Weights(filenames, device=cuda_device, dtype=dtype, process_group=process_group)
 
-    model = MODEL_REGISTRY[args.model_type](config, weights)
+    model = MODEL_REGISTRY[config.model_type](config, weights)
     model.eval()
 
     torch.distributed.barrier(process_group)
+
+    if rank == 0:
+        print(f"{model.__class__.__name__} setup is done.")
 
     # NOTE (230818)
     # - 현재 단계에서는 batch 처리를 생각하지않음.

@@ -56,8 +56,7 @@ def main():
         args.pretrained_model_path,
     )
 
-    model_type = config.__class__.__name__.lower()
-    model_type = model_type.replace("config", "")
+    model_type = config.model_type
     max_sequence_length = config.n_positions
 
     torch.distributed.barrier(process_group)
