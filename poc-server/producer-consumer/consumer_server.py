@@ -52,7 +52,10 @@ def main():
     config = AutoConfig.from_pretrained(
         args.pretrained_model_path,
     )
-    max_sequence_length = config.n_positions
+
+    max_sequence_length = None
+    max_sequence_length = getattr(config, "n_positions", None)
+    max_sequence_length = getattr(config, "max_position_embeddings", None)
 
     filenames = weight_files(args.pretrained_model_path)
     weights = Weights(filenames, device=cuda_device, dtype=dtype, process_group=process_group)

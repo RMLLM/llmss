@@ -57,7 +57,10 @@ def main():
     )
 
     model_type = config.model_type
-    max_sequence_length = config.n_positions
+
+    max_sequence_length = None
+    max_sequence_length = getattr(config, "n_positions", None)
+    max_sequence_length = getattr(config, "max_position_embeddings", None)
 
     torch.distributed.barrier(process_group)
 
@@ -146,7 +149,6 @@ def main():
     else:
         while num_new_tokens < max_new_tokens:
             with torch.no_grad():
-
                 outputs = model(buffer_idss, use_cache=False)
                 logits = outputs.logits
 
@@ -184,7 +186,7 @@ def main():
                     f"cuda:{rank}"
                 )
 
-            torch.cuda.empty_cache() # Prevent cuda memory leak
+            torch.cuda.empty_cache()  # Prevent cuda memory leak
             dist.broadcast(buffer_idss, src=0)
 
             num_new_tokens += 1
