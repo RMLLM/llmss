@@ -1,6 +1,9 @@
 # Producer-consumer style inference server
 ## Preliminary
-https://huggingface.co/heegyu/kogpt-j-350m/tree/main 의 모델을 사용해 테스트 하였습니다. safetensor의 형태로 checkpoint가 저장되어있어야합니다.
+Supported model checkpoints should be saved with safetensor format.
+
+- Supported model
+  - `gptj`, `gpt_bigcode` (e.g. starcoder), `llama`
 
 ```bash
 pip install -r requirements.txt
@@ -24,14 +27,12 @@ python producer_server.py \
 
 ### Consumer
 ```bash
-# Currently, only support gptj
 # Require gpus along number of --nproc_per_node
 torchrun \
 --nnodes 1 \
 --nproc_per_node 4 \
 consumer_server.py \
---model_type gptj \
---pretrained_model_path /data/nick_262/llmss/temp_ckpt_for_test \
+--pretrained_model_path ${SUPPORTED_MODEl_CHECKPOINT} \
 --redis_host 127.0.0.1 \
 --redis_port 20000
 ```
@@ -43,7 +44,7 @@ curl \
 -H 'accept: application/json' \
 -H 'Content-Type: application/json' \
 -d '{
-    "prompt": "이것은 테스트입니다.",
+    "prompt": "What's your name?",
     "max_new_tokens": 32,
     "is_greedy": false,
     "temperature": 1.0,

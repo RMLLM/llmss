@@ -7,29 +7,27 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
-
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
 )
 from transformers.modeling_utils import PreTrainedModel
+from transformers.models.gpt_bigcode.configuration_gpt_bigcode import GPTBigCodeConfig
 from transformers.utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
 )
-from transformers.models.gpt_bigcode.configuration_gpt_bigcode import GPTBigCodeConfig
 
 from ..utils.layers import (
     FastLinear,
-    TensorParallelEmbedding,
     TensorParallelColumnLinear,
-    TensorParallelRowLinear,
+    TensorParallelEmbedding,
     TensorParallelHead,
+    TensorParallelRowLinear,
 )
-
 
 logger = logging.get_logger(__name__)
 
@@ -80,9 +78,9 @@ class GPTBigCodeAttention(nn.Module):
         self.multi_query = config.multi_query
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads            # 6144 // 48 == 128
+        self.head_dim = self.embed_dim // self.num_heads  # 6144 // 48 == 128
         self.kv_heads = 1 if self.multi_query else self.num_heads
-        self.kv_dim = self.kv_heads * self.head_dim                 # 1 * 128 == 128
+        self.kv_dim = self.kv_heads * self.head_dim  # 1 * 128 == 128
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -121,20 +119,20 @@ class GPTBigCodeAttention(nn.Module):
             # 1. Load tensors
             c_attn_weight = weights.get_tensor(f"{prefix}.c_attn.weight")
             c_attn_bias = weights.get_tensor(f"{prefix}.c_attn.bias")
-            
+
             # 2. Split the tensor into 2 matrices (q_attn, kv_attn)
             q_attn_weight, kv_attn_weight = c_attn_weight.split((self.embed_dim, 2 * self.kv_dim), dim=0)
             q_attn_bias, kv_attn_bias = c_attn_bias.split((self.embed_dim, 2 * self.kv_dim), dim=0)
 
             # 3. Slice by its rank
-            dim = 0     # due to this was meant for ColumnLinear
+            dim = 0  # due to this was meant for ColumnLinear
             world_size = self.process_group.size()
             rank = self.process_group.rank()
             size = q_attn_weight.size(dim)
             block_size = size // world_size
             start = rank * block_size
             stop = (rank + 1) * block_size
-            
+
             if dim == 0:
                 q_attn_weight_tensor = q_attn_weight[start:stop]
                 q_attn_bias_tensor = q_attn_bias[start:stop]
@@ -143,10 +141,10 @@ class GPTBigCodeAttention(nn.Module):
                 q_attn_bias_tensor = q_attn_bias[:, start:stop]
             else:
                 raise NotImplementedError("Let's make that generic when needed")
-            
+
             # 4. Construct TensorParallelColumnLinear with FastLinear
             self.q_attn = TensorParallelColumnLinear(FastLinear(weight=q_attn_weight_tensor, bias=q_attn_bias_tensor))
-            
+
             self.kv_attn = nn.Linear(
                 in_features=self.embed_dim, out_features=2 * self.kv_dim, dtype=self.q_attn.linear.weight.dtype
             ).to(f"cuda:{rank}")
@@ -272,8 +270,8 @@ class GPTBigCodeAttention(nn.Module):
         elif self.multi_query:
             # hidden_states: (bsz, seq_len, hnp)
             # query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
-            query = self.q_attn(hidden_states)          # (B, q_len, H) -> (B, q_len, hp) == (1, 7, 6144/2)
-            key_value = self.kv_attn(hidden_states)     # (B, k_len, H) -> (B, k_len, 2*head_dim) == (1, 7, 2*128)            
+            query = self.q_attn(hidden_states)  # (B, q_len, H) -> (B, q_len, hp) == (1, 7, 6144/2)
+            key_value = self.kv_attn(hidden_states)  # (B, k_len, H) -> (B, k_len, 2*head_dim) == (1, 7, 2*128)
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
@@ -311,10 +309,8 @@ class GPTBigCodeAttention(nn.Module):
 class GPTBigCodeMLP(nn.Module):
     def __init__(self, prefix, config: GPTBigCodeConfig, weights):
         super().__init__()
-        
-        self.c_fc = TensorParallelColumnLinear.load(
-            config=config, prefix=f"{prefix}.c_fc", weights=weights, bias=True
-        )
+
+        self.c_fc = TensorParallelColumnLinear.load(config=config, prefix=f"{prefix}.c_fc", weights=weights, bias=True)
         self.c_proj = TensorParallelRowLinear.load(
             config=config, prefix=f"{prefix}.c_proj", weights=weights, bias=True
         )
@@ -345,8 +341,12 @@ class GPTBigCodeBlock(nn.Module):
         if config.add_cross_attention:
             if config.multi_query:
                 raise NotImplementedError("Cross-attention not implemented for MQA")
-            self.crossattention = GPTBigCodeAttention(prefix=f"{prefix}.crossattention", config=config, weights=weights, is_cross_attention=True)
-            self.ln_cross_attn = nn.LayerNorm.load(prefix=f"{prefix}.ln_cross_attn", weights=weights, eps=config.layer_norm_epsilon)
+            self.crossattention = GPTBigCodeAttention(
+                prefix=f"{prefix}.crossattention", config=config, weights=weights, is_cross_attention=True
+            )
+            self.ln_cross_attn = nn.LayerNorm.load(
+                prefix=f"{prefix}.ln_cross_attn", weights=weights, eps=config.layer_norm_epsilon
+            )
 
         self.mlp = GPTBigCodeMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
@@ -560,14 +560,14 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
-        
+
         self.wte = TensorParallelEmbedding(prefix="transformer.wte", weights=weights)
-        self.wpe = TensorParallelEmbedding(prefix="transformer.wpe", weights=weights)   # need to check        
+        self.wpe = TensorParallelEmbedding(prefix="transformer.wpe", weights=weights)  # need to check
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList(
             [
-                GPTBigCodeBlock(prefix=f"transformer.h.{layer_id}", config=config, weights=weights, layer_idx=layer_id) 
+                GPTBigCodeBlock(prefix=f"transformer.h.{layer_id}", config=config, weights=weights, layer_idx=layer_id)
                 for layer_id in range(config.n_layer)
             ]
         )
@@ -625,7 +625,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
             # self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
-            batch_size = input_ids.shape[0]            
+            batch_size = input_ids.shape[0]
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
             batch_size = inputs_embeds.shape[0]
@@ -694,7 +694,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)    # (B, L, H)
+        position_embeds = self.wpe(position_ids)  # (B, L, H)
 
         hidden_states = inputs_embeds + position_embeds
 
