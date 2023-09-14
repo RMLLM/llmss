@@ -13,6 +13,7 @@ pip install -r requirements.txt
 ### Broker
 ```bash
 # before install redis
+# sudo apt-get install redis-server
 redis-server --port 20000
 ```
 
@@ -39,17 +40,13 @@ consumer_server.py \
 
 ## Test
 ```bash
-curl \
--X 'POST' \
--H 'accept: application/json' \
--H 'Content-Type: application/json' \
--d '{
-    "prompt": "What's your name?",
-    "max_new_tokens": 32,
-    "is_greedy": false,
-    "temperature": 1.0,
-    "top_p": 0.9,
-    "top_k": 50
-}' \
-'http://localhost:8000/generate'
+curl localhost:8000/generate \
+  -X POST \
+  -d '{"prompt":"What is deep learning?",
+      "max_new_tokens":10,
+      "is_greedy": false,
+      "temperature": 1.0,
+      "top_p": 0.9,
+      "top_k": 50}' \
+  -H 'Content-Type: application/json'
 ```
