@@ -88,13 +88,13 @@ LlamaRMSNorm.load_no_bias = load_layer_norm_no_bias
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
-    def __init__(self, inv_freq, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        self.inv_freq = inv_freq
+        self.inv_freq = self._create_inv_freq(dim=dim, base=base, device=device)
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
@@ -121,14 +121,9 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
-    @classmethod
-    def load(cls, dim, max_position_embeddings, base, prefix, weights):
-        # XXX: Always load this in float32 !
-        dtype = weights.dtype
-        weights.dtype = torch.float32
-        inv_freq = weights.get_tensor(f"{prefix}.inv_freq")
-        weights.dtype = dtype
-        return cls(inv_freq=inv_freq, dim=dim, max_position_embeddings=max_position_embeddings, base=base)
+    def _create_inv_freq(self, dim, base, device):
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+        return inv_freq
 
 
 def rotate_half(x):
@@ -205,18 +200,13 @@ class LlamaAttention(nn.Module):
         self.hidden_size = self.hidden_size // process_group.size()
         self.num_heads = self.num_heads // process_group.size()
         self.num_key_value_heads = self.num_key_value_heads // process_group.size()
-        # self.num_key_value_groups = self.num_key_value_groups // process_group.size()
 
         self.q_proj = TensorParallelColumnLinear.load(config, prefix=f"{prefix}.q_proj", weights=weights, bias=False)
         self.k_proj = TensorParallelColumnLinear.load(config, prefix=f"{prefix}.k_proj", weights=weights, bias=False)
         self.v_proj = TensorParallelColumnLinear.load(config, prefix=f"{prefix}.v_proj", weights=weights, bias=False)
         self.o_proj = TensorParallelRowLinear.load(config, prefix=f"{prefix}.o_proj", weights=weights, bias=False)
-        self.rotary_emb = LlamaRotaryEmbedding.load(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-            prefix=f"{prefix}.rotary_emb",
-            weights=weights,
+        self.rotary_emb = LlamaRotaryEmbedding(
+            self.head_dim, self.max_position_embeddings, base=self.rope_theta, device=weights.device
         )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
