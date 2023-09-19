@@ -26,16 +26,17 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from ...modeling_utils import PreTrainedModel
-from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
-from .configuration_open_llama import OpenLlamaConfig
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
+from transformers.models.deprecated.open_llama.configuration_open_llama import OpenLlamaConfig
 
 from ..utils.layers import (
     TensorParallelColumnLinear,
     TensorParallelRowLinear,
     TensorParallelHead,
+    TensorParallelEmbedding,
     load_layer_norm_no_bias
 )
 
@@ -207,10 +208,11 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
-    gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
-    cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
-    sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -231,7 +233,7 @@ class OpenLlamaMLP(nn.Module):
         )
         
         self.act_fn = ACT2FN[config.hidden_act]
-        self.dropout = nn.Dropout(config.dropout_prob)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, x):
         out = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -277,26 +279,25 @@ class OpenLlamaAttention(nn.Module):
     # Copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->OpenLlama
     def _init_rope(self, prefix, weights):
         if self.config.rope_scaling is None:
-            self.rotary_emb = OpenLlamaRotaryEmbedding.load(
+            self.rotary_emb = OpenLlamaRotaryEmbedding(
                 self.head_dim, max_position_embeddings=self.max_position_embeddings,
-                prefix=f"{prefix}.rotary_emb",
-                weights=weights
+                device=weights.device
             )
         else:
             scaling_type = self.config.rope_scaling["type"]
             # unused config when load weights
             # scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
-                self.rotary_emb = OpenLlamaLinearScalingRotaryEmbedding.load(
+                self.rotary_emb = OpenLlamaLinearScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings,
-                    prefix=f"{prefix}.rotary_emb",
-                    weights=weights
+                    device=weights.device,
+                    base=self.config.rope_scaling["factor"]
                 )
             elif scaling_type == "dynamic":
-                self.rotary_emb = OpenLlamaDynamicNTKScalingRotaryEmbedding.load(
+                self.rotary_emb = OpenLlamaDynamicNTKScalingRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings,
-                    prefix=f"{prefix}.rotary_emb",
-                    weights=weights
+                    device=weights.device,
+                    base=self.config.rope_scaling["factor"]
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -385,8 +386,8 @@ class OpenLlamaDecoderLayer(nn.Module):
     def __init__(self, prefix, config: OpenLlamaConfig, weights):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = OpenLlamaAttention(prefix, config, weights)
-        self.mlp = OpenLlamaMLP(prefix, config, weights)
+        self.self_attn = OpenLlamaAttention(f"{prefix}.self_attn", config, weights)
+        self.mlp = OpenLlamaMLP(f"{prefix}.mlp", config, weights)
         self.input_layernorm = OpenLlamaRMSNorm.load_no_bias(
             prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps
         )
@@ -572,18 +573,26 @@ class OpenLlamaModel(OpenLlamaPreTrainedModel):
         config: OpenLlamaConfig
     """
 
-    def __init__(self, config: OpenLlamaConfig):
+    def __init__(self, config: OpenLlamaConfig, weights):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = TensorParallelEmbedding(prefix="model.embed_tokens", weights=weights)
+        
+        # should this be tensor parallized?
         if config.use_stable_embedding:
             self.embed_layer_norm = nn.LayerNorm(config.hidden_size)
         else:
             self.embed_layer_norm = None
-        self.layers = nn.ModuleList([OpenLlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = OpenLlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            
+        self.layers = nn.ModuleList(
+            [
+                OpenLlamaDecoderLayer(prefix=f"model.layers.{_}", config=config, weights=weights)
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = OpenLlamaRMSNorm.load_no_bias(prefix=f"model.norm", weights=weights, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -753,13 +762,13 @@ class OpenLlamaModel(OpenLlamaPreTrainedModel):
 
 
 class OpenLlamaForCausalLM(OpenLlamaPreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config, weights):
         super().__init__(config)
-        self.model = OpenLlamaModel(config)
+        self.model = OpenLlamaModel(config, weights)
         if config.shared_input_output_embedding:
             self.lm_head = None
         else:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = TensorParallelHead.load(config, prefix="lm_head", weights=weights)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -913,124 +922,3 @@ class OpenLlamaForCausalLM(OpenLlamaPreTrainedModel):
         for layer_past in past_key_values:
             reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
         return reordered_past
-
-
-@add_start_docstrings(
-    """
-    The LLaMa Model transformer with a sequence classification head on top (linear layer).
-
-    [`OpenLlamaForSequenceClassification`] uses the last token in order to do the classification, as other causal
-    models (e.g. GPT-2) do.
-
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    OPEN_LLAMA_START_DOCSTRING,
-)
-# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with LLAMA->OPEN_LLAMA,Llama->OpenLlama
-class OpenLlamaForSequenceClassification(OpenLlamaPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = OpenLlamaModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(OPEN_LLAMA_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        transformer_outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
-        logits = self.score(hidden_states)
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(logits.device)
-            else:
-                sequence_lengths = -1
-
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
-
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
-        if not return_dict:
-            output = (pooled_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
